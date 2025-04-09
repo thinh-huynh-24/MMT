@@ -1,93 +1,91 @@
-import socket
-import json
-import hashlib
-import os
-import requests
-import threading
+import socket, json, os, hashlib, threading, requests
 
-def sha1(data):
-    return hashlib.sha1(data).hexdigest()
+TRACKER_URL = "http://localhost:5000"
+DOWNLOAD_FOLDER = "downloads"
+PROGRESS_FOLDER = os.path.join(DOWNLOAD_FOLDER, ".progress")
+PIECE_LENGTH = 512
 
-def get_peers_from_tracker(torrent):
-    tracker_url = torrent["tracker_url"]
-    info_hash = torrent["info_hash"]
+def sha1(data): return hashlib.sha1(data).hexdigest()
 
+def load_torrent(torrent_path):
+    with open(torrent_path, "r") as f:
+        return json.load(f)
+
+def get_peers(info_hash):
     try:
-        response = requests.get(f"{tracker_url}/peers", params={"info_hash": info_hash})
-        data = response.json()
-        return data.get("peers", [])
-    except Exception as e:
-        print(f"❌ Lỗi lấy danh sách peers: {e}")
+        r = requests.get(f"{TRACKER_URL}/peers", params={"info_hash": info_hash})
+        return r.json().get("peers", [])
+    except:
         return []
 
-def download_piece(ip, port, info_hash, piece_index):
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.connect((ip, port))
-            request = f"{info_hash}|{piece_index}"
-            s.sendall(request.encode())
-            data = s.recv(4096)
-            return data
-    except Exception as e:
-        print(f"❌ Lỗi khi kết nối tới {ip}:{port} - {e}")
-        return None
+def resume_bitmap(info_hash, total_pieces):
+    os.makedirs(PROGRESS_FOLDER, exist_ok=True)
+    path = os.path.join(PROGRESS_FOLDER, f"{info_hash}.progress")
+    if os.path.exists(path):
+        with open(path) as f: return json.load(f)
+    return [False] * total_pieces
 
-def download_file_from_torrent(torrent_file_path):
-    with open(torrent_file_path, "r") as f:
-        torrent = json.load(f)
+def save_bitmap(info_hash, bitmap):
+    path = os.path.join(PROGRESS_FOLDER, f"{info_hash}.progress")
+    with open(path, "w") as f: json.dump(bitmap, f)
 
-    info_hash = torrent["info_hash"]
+def reconstruct(info, pieces_data):
+    if "file_name" in info:
+        out_path = os.path.join(DOWNLOAD_FOLDER, "downloaded_" + info["file_name"])
+        with open(out_path, "wb") as f:
+            for p in pieces_data: f.write(p)
+        print(f"🎉 Đã tải: {out_path}")
+    else:
+        folder = os.path.join(DOWNLOAD_FOLDER, info["folder_name"])
+        os.makedirs(folder, exist_ok=True)
+        buffer = b"".join(pieces_data)
+        offset = 0
+        for fobj in info["files"]:
+            path = os.path.join(folder, fobj["path"])
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(buffer[offset:offset+fobj["length"]])
+            offset += fobj["length"]
+        print(f"🎉 Đã tải thư mục: {folder}")
+
+def download_from_torrent(torrent_path):
+    torrent = load_torrent(torrent_path)
     info = torrent["info"]
-    expected_pieces = info["pieces"]
-    total_pieces = len(expected_pieces)
+    info_hash = torrent["info_hash"]
+    peers = get_peers(info_hash)
+    total = len(info["pieces"])
+    pieces_data = [None] * total
+    bitmap = resume_bitmap(info_hash, total)
 
-    peers = get_peers_from_tracker(torrent)
-    if not peers:
-        print("❌ Không tìm thấy Seeder từ tracker.")
-        return
-
-    os.makedirs("downloads", exist_ok=True)
-    output_path = os.path.join("downloads", "downloaded_" + info["file_name"])
-    result_buffer = [None] * total_pieces
-    lock = threading.Lock()
-
-    def download_piece_thread(i):
-        nonlocal result_buffer
+    def download_piece(i):
+        if bitmap[i]: return
         for peer in peers:
-            ip = peer["ip"]
-            port = peer["port"]
             try:
-                print(f"🔗 [Thread-{i}] Thử tải piece {i} từ {ip}:{port}")
-                data = download_piece(ip, port, info_hash, i)
-                if data and sha1(data) == expected_pieces[i]:
-                    with lock:
-                        result_buffer[i] = data
-                    print(f"✅ [Thread-{i}] Piece {i} hợp lệ từ {ip}")
+                s = socket.socket(); s.connect((peer["ip"], peer["port"]))
+                s.sendall(f"{info_hash}|{i}".encode())
+                data = s.recv(4096); s.close()
+                if sha1(data) == info["pieces"][i]:
+                    pieces_data[i] = data
+                    bitmap[i] = True
+                    save_bitmap(info_hash, bitmap)
+                    print(f"✅ Piece {i} OK")
                     return
-                else:
-                    print(f"⚠️ [Thread-{i}] Hash không đúng từ {ip}")
-            except Exception as e:
-                print(f"❌ [Thread-{i}] Lỗi từ {ip}:{port} - {e}")
+            except: continue
 
     threads = []
-    for i in range(total_pieces):
-        t = threading.Thread(target=download_piece_thread, args=(i,))
-        t.start()
-        threads.append(t)
+    for i in range(total):
+        t = threading.Thread(target=download_piece, args=(i,))
+        t.start(); threads.append(t)
+    for t in threads: t.join()
 
-    for t in threads:
-        t.join()
-
-    if None in result_buffer:
-        print("❌ Một số pieces không tải được.")
+    if not all(bitmap):
+        print("⚠️ Một số piece chưa hoàn tất.")
         return
 
-    with open(output_path, "wb") as f:
-        for piece in result_buffer:
-            f.write(piece)
-
-    print(f"\n✅ Hoàn tất tải file song song! Lưu tại: {output_path}")
+    reconstruct(info, pieces_data)
+    try: os.remove(os.path.join(PROGRESS_FOLDER, f"{info_hash}.progress"))
+    except: pass
 
 if __name__ == "__main__":
-    os.makedirs("torrents", exist_ok=True)
-    download_file_from_torrent("torrents/example.txt.torrent")
+    path = input("📥 Nhập đường dẫn .torrent: ").strip()
+    download_from_torrent(path)

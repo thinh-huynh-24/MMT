@@ -1,81 +1,78 @@
+import os
+import json
 import socket
 import threading
-import json
-import os
-import requests
+import hashlib
 
-def load_shared_data(torrent_path="torrents/example.txt.torrent"):
+SHARED_FOLDER = "shared"
+PIECE_LENGTH = 512
+
+def sha1(data): return hashlib.sha1(data).hexdigest()
+
+def load_torrent(torrent_path):
     with open(torrent_path, "r") as f:
-        torrent = json.load(f)
+        return json.load(f)
 
-    file_name = torrent["info"]["file_name"]
-    piece_length = torrent["info"]["piece_length"]
+def prepare_piece_data(torrent):
+    info = torrent["info"]
+    piece_len = info["piece_length"]
+    data, buffer, index = {}, b"", 0
+
+    if "file_name" in info:
+        path = os.path.join(SHARED_FOLDER, info["file_name"])
+        with open(path, "rb") as f:
+            while chunk := f.read(4096):
+                buffer += chunk
+                while len(buffer) >= piece_len:
+                    data[index] = buffer[:piece_len]
+                    buffer = buffer[piece_len:]
+                    index += 1
+    else:
+        for file in info["files"]:
+            path = os.path.join(SHARED_FOLDER, info["folder_name"], file["path"])
+            with open(path, "rb") as f:
+                while chunk := f.read(4096):
+                    buffer += chunk
+                    while len(buffer) >= piece_len:
+                        data[index] = buffer[:piece_len]
+                        buffer = buffer[piece_len:]
+                        index += 1
+    if buffer:
+        data[index] = buffer
+    return data
+
+def run_seeder(torrent_path):
+    torrent = load_torrent(torrent_path)
     info_hash = torrent["info_hash"]
-    file_path = os.path.join("shared", file_name)
+    piece_data = prepare_piece_data(torrent)
 
-    shared_data = {}
-    with open(file_path, "rb") as f:
-        i = 0
+    def handle_client(conn, addr):
+        try:
+            msg = conn.recv(1024).decode()
+            parts = msg.strip().split("|")
+            if len(parts) != 2 or parts[0] != info_hash:
+                conn.sendall(b"INVALID")
+                return
+            index = int(parts[1])
+            conn.sendall(piece_data.get(index, b"NOT_FOUND"))
+            print(f"📤 Gửi piece {index} cho {addr}")
+        except Exception as e:
+            print(f"⚠️ Lỗi client {addr}: {e}")
+        finally:
+            conn.close()
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("0.0.0.0", 6881))
+    s.listen(5)
+    print("📡 Seeder đã sẵn sàng, chờ peer kết nối...")
+
+    try:
         while True:
-            piece = f.read(piece_length)
-            if not piece:
-                break
-            if info_hash not in shared_data:
-                shared_data[info_hash] = {}
-            shared_data[info_hash][i] = piece
-            i += 1
-    return shared_data, info_hash, torrent["tracker_url"]
-
-def register_with_tracker(info_hash, tracker_url, peer_id="seeder001", ip="127.0.0.1", port=6881):
-    data = {
-        "info_hash": info_hash,
-        "peer_id": peer_id,
-        "ip": ip,
-        "port": port,
-        "event": "started"
-    }
-
-    try:
-        res = requests.post(f"{tracker_url}/announce", json=data)
-        if res.status_code == 200:
-            print("✅ Đã đăng ký với tracker!")
-        else:
-            print("❌ Không thể đăng ký với tracker:", res.text)
-    except Exception as e:
-        print("❌ Lỗi kết nối tracker:", e)
-
-def handle_client(conn, addr, SHARED_DATA):
-    print(f"📥 Kết nối từ {addr}")
-    try:
-        data = conn.recv(1024).decode()
-        parts = data.strip().split("|")
-        if len(parts) != 2:
-            conn.sendall(b"INVALID_FORMAT")
-            return
-
-        info_hash, piece_index = parts[0], int(parts[1])
-        if info_hash in SHARED_DATA and piece_index in SHARED_DATA[info_hash]:
-            piece_data = SHARED_DATA[info_hash][piece_index]
-            conn.sendall(piece_data)
-        else:
-            conn.sendall(b"PIECE_NOT_FOUND")
-    finally:
-        conn.close()
-
-def start_server(port=6881):
-    SHARED_DATA, info_hash, tracker_url = load_shared_data()
-    register_with_tracker(info_hash, tracker_url, port=port)
-
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind(("0.0.0.0", port))
-    server.listen(5)
-    print(f"📡 Seeder đang lắng nghe tại cổng {port}...")
-
-    while True:
-        conn, addr = server.accept()
-        thread = threading.Thread(target=handle_client, args=(conn, addr, SHARED_DATA))
-        thread.start()
+            conn, addr = s.accept()
+            threading.Thread(target=handle_client, args=(conn, addr)).start()
+    except KeyboardInterrupt:
+        print("🛑 Dừng Seeder.")
 
 if __name__ == "__main__":
-    os.makedirs("shared", exist_ok=True)
-    start_server()
+    path = input("📦 Nhập đường dẫn file .torrent: ").strip()
+    run_seeder(path)
