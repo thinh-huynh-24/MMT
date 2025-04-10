@@ -1,6 +1,6 @@
 {
     "info_hash": "51aeffb5b782856fb1c742dead1951926121e53c",
-    "tracker_url": "http://192.168.223.88:5000",
+    "tracker_url": "http://localhost:5000",
     "info": {
         "file_name": "a.png",
         "file_size": 1912040,

@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template_string
 import sqlite3, hashlib, secrets
 from collections import defaultdict
 
@@ -71,10 +71,12 @@ def announce():
     event = d.get("event", "started")
 
     if event == "started":
-        if peer not in torrents[info_hash]: torrents[info_hash].append(peer)
+        if peer not in torrents[info_hash]:
+            torrents[info_hash].append(peer)
         return jsonify({"status": "registered", "peers": torrents[info_hash]})
     elif event == "stopped":
-        if peer in torrents[info_hash]: torrents[info_hash].remove(peer)
+        if peer in torrents[info_hash]:
+            torrents[info_hash].remove(peer)
         return jsonify({"status": "removed"})
     elif event == "upload":
         stats[info_hash]["uploads"][user_id] = stats[info_hash]["uploads"].get(user_id, 0) + 1
@@ -93,6 +95,25 @@ def get_peers():
 def get_stats():
     info_hash = request.args.get("info_hash")
     return jsonify(stats[info_hash])
+
+@app.route("/peers/list", methods=["GET"])
+def list_peers():
+    html = """
+    <h2>📡 Danh sách các Peers đang đăng ký</h2>
+    {% if torrents %}
+        {% for info_hash, peers in torrents.items() %}
+            <h4>📁 Info Hash: {{ info_hash }}</h4>
+            <ul>
+                {% for peer in peers %}
+                    <li>🧑 Peer ID: {{ peer['peer_id'] }} | IP: {{ peer['ip'] }} | Port: {{ peer['port'] }}</li>
+                {% endfor %}
+            </ul>
+        {% endfor %}
+    {% else %}
+        <p>❌ Không có peer nào đang hoạt động.</p>
+    {% endif %}
+    """
+    return render_template_string(html, torrents=torrents)
 
 if __name__ == "__main__":
     init_db()
